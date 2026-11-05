@@ -1,0 +1,68 @@
+# ── Node / Frontend ────────────────────────────────────────────────────────────
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── Python / Backend ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# Pytest / coverage / build
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.cache/
+
+# ── Environment variables ──────────────────────────────────────────────────────
+.env*
+!.env.example
+
+# ── Certificates & Private Keys ────────────────────────────────────────────────
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+
+# ── CSV Logs & Temporary Files ────────────────────────────────────────────────
+# Ignore arbitrary / uploaded CSV files, but retain synthetic demo datasets
+*.csv
+!backend/data/*.csv
+*.tmp
+*.temp
+
+# ── Editor directories & OS files ──────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db

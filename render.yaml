@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: threatlens-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "10"
+      - key: MAX_UPLOAD_ROWS
+        value: "50000"
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: PORTFOLIO_READ_ONLY
+        value: "true"
