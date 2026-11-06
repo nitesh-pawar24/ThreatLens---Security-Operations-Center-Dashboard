@@ -388,7 +388,7 @@ class DetectorConfig:
             ("multi_account_changes_threshold", self.multi_account_changes_threshold),
         ]
         for name, val in int_fields_min1:
-            if not isinstance(val, int) or val < 1:
+            if not isinstance(val, int) or isinstance(val, bool) or val < 1:
                 errors.append(f"'{name}' must be an integer ≥ 1 (got {val!r}).")
 
         window_fields = [
@@ -402,17 +402,26 @@ class DetectorConfig:
             ("multi_account_changes_window_seconds", self.multi_account_changes_window_seconds),
         ]
         for name, val in window_fields:
-            if not isinstance(val, int):
+            if not isinstance(val, int) or isinstance(val, bool):
                 errors.append(f"'{name}' must be an integer (got {val!r}).")
             elif val < 10:
                 errors.append(f"'{name}' must be ≥ 10 seconds (got {val}).")
             elif val > 86400:
                 errors.append(f"'{name}' must be ≤ 86400 seconds / 24 h (got {val}).")
 
-        if not isinstance(self.dedup_window_seconds, int) or self.dedup_window_seconds < 0:
+        if (
+            not isinstance(self.dedup_window_seconds, int)
+            or isinstance(self.dedup_window_seconds, bool)
+            or self.dedup_window_seconds < 0
+        ):
             errors.append(
                 f"'dedup_window_seconds' must be a non-negative integer (got {self.dedup_window_seconds!r})."
             )
+
+        for name in ("enable_account_brute_force", "enable_logon_after_brute_force", "enable_multi_account_changes"):
+            val = getattr(self, name)
+            if not isinstance(val, bool):
+                errors.append(f"'{name}' must be true or false (got {val!r}).")
 
         return errors
 

@@ -4,12 +4,31 @@ ThreatLens – FastAPI Backend API
 REST API layer exposing the ThreatLens detection engine to the frontend.
 
 Endpoints:
-    GET  /api/health      - System health status and engine readiness
-    GET  /api/summary     - Summary metrics, chart series, and IP stats
-    GET  /api/alerts      - Filterable list of security alerts
-    GET  /api/logs        - Filterable list of parsed log rows
-    POST /api/analyze     - Upload and analyze a CSV log file
-    POST /api/reset       - Reset to default sample dataset
+    GET    /api/health      - Health, capabilities (uploads enabled, session mode, limits)
+    POST   /api/session     - Issue a visitor session token (MULTI_TENANT_SESSIONS only)
+    DELETE /api/session     - End the caller's visitor session
+    GET    /api/summary     - Summary metrics, chart series, and IP stats
+    GET    /api/alerts      - Filterable list of security alerts
+    GET    /api/logs        - Filterable list of parsed log rows
+    POST   /api/analyze     - Upload and analyze a CSV log file
+    POST   /api/analyze/windows - Import a Windows Event Viewer CSV export
+    POST   /api/reset       - Reset the dataset (empty, or ?sample=true)
+    POST   /api/sample      - Load the synthetic sample dataset
+    GET/PUT /api/detection/config - Detection thresholds
+
+Data scoping
+------------
+* MULTI_TENANT_SESSIONS=false (local development, tests): one process-wide
+  dataset in ``state`` – exactly the historical behaviour.
+* MULTI_TENANT_SESSIONS=true (public deployment): there is NO shared dataset.
+  Every data endpoint requires an ``X-Session-ID`` header naming a visitor
+  session issued by ``POST /api/session``. Summaries, alerts, logs, uploads,
+  resets, sample loading and detection configuration all act on that
+  session's private state only. A missing, malformed, unknown or expired token
+  gets HTTP 401 - there is never a fallback to another dataset.
+* PORTFOLIO_READ_ONLY=true is an emergency kill switch that blocks every write
+  (uploads, resets, sample loading, config changes) in both modes unless the
+  ADMIN_API_KEY is presented. It is independent of MULTI_TENANT_SESSIONS.
 
 ⚠️  All log data and alerts are simulated for demonstration purposes.
     No live network monitoring, packet capture, or external calls are made.
@@ -21,19 +40,33 @@ import io
 import hmac
 import logging
 import os
+import threading
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional, Union
 
 import pandas as pd
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.detector import Alert, DetectorConfig, SEVERITY_RANK, run_detection
 from backend.log_parser import load_log
+from backend.session import (
+    DataSnapshot,
+    SessionCapacityError,
+    SessionConcurrencyError,
+    SessionConflictError,
+    SessionError,
+    SessionInvalidTokenError,
+    SessionMemoryError,
+    SessionState,
+    estimate_dataset_memory,
+    estimate_incoming_bytes,
+    session_manager,
+)
 from backend.windows_log_importer import (
     EVENT_ID_MAP,
     load_windows_log,
@@ -50,14 +83,73 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
 # ── Production Environment Settings ───────────────────────────────────────────
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("true", "1", "yes")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_UPLOAD_ROWS = int(os.getenv("MAX_UPLOAD_ROWS", "50000"))
-RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in ("true", "1", "yes")
+RATE_LIMIT_ENABLED = _env_flag("RATE_LIMIT_ENABLED", "true")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-PORTFOLIO_READ_ONLY = os.getenv("PORTFOLIO_READ_ONLY", os.getenv("PUBLIC_DEMO_MODE", "false")).lower() in ("true", "1", "yes")
 SAMPLE_CSV_PATH = Path(__file__).parent / "data" / "sample_logs.csv"
+SAMPLE_DATASET_NAME = "sample_logs.csv (Simulated Demo)"
+
+# Per-visitor session mode. When true, every data endpoint is scoped to an
+# X-Session-ID session and the shared global dataset is never served.
+MULTI_TENANT_SESSIONS = _env_flag("MULTI_TENANT_SESSIONS", "false")
+# How long a second mutation on the same session waits before reporting a conflict.
+SESSION_TXN_TIMEOUT_SECONDS = _env_float("SESSION_TXN_TIMEOUT_SECONDS", 2.0)
+# Extra bytes allowed on top of MAX_UPLOAD_SIZE_BYTES for multipart framing.
+UPLOAD_ENVELOPE_BYTES = 256 * 1024
+UPLOAD_PATHS = ("/api/analyze", "/api/analyze/windows")
+
+_ON_PUBLIC_HOST = _env_flag("RENDER")  # Render sets RENDER=true on every service
+_ALLOW_SHARED_GLOBAL_STATE = _env_flag("ALLOW_SHARED_GLOBAL_STATE")
+
+
+def resolve_write_protection(
+    read_only: bool, multi_tenant: bool, public_host: bool, allow_shared: bool
+) -> tuple[bool, bool]:
+    """
+    Decide the effective read-only flag.
+
+    Guard rail: on a public host (Render) with neither read-only mode nor
+    per-visitor sessions, every visitor would share, and be able to overwrite,
+    one in-memory dataset. That combination is forced back to read-only unless
+    ALLOW_SHARED_GLOBAL_STATE=true is set explicitly.
+
+    Returns (effective_read_only, was_forced).
+    """
+    if public_host and not multi_tenant and not read_only and not allow_shared:
+        return True, True
+    return read_only, False
+
+
+_requested_read_only = os.getenv("PORTFOLIO_READ_ONLY", os.getenv("PUBLIC_DEMO_MODE", "false")).strip().lower() in (
+    "true", "1", "yes",
+)
+PORTFOLIO_READ_ONLY, _READ_ONLY_FORCED = resolve_write_protection(
+    _requested_read_only, MULTI_TENANT_SESSIONS, _ON_PUBLIC_HOST, _ALLOW_SHARED_GLOBAL_STATE
+)
+if _READ_ONLY_FORCED:
+    logger.warning(
+        "PORTFOLIO_READ_ONLY=false without MULTI_TENANT_SESSIONS=true on a public host would let "
+        "visitors overwrite one shared dataset. Forcing read-only mode. Set MULTI_TENANT_SESSIONS=true "
+        "to enable per-visitor uploads."
+    )
+logger.info(
+    "ThreatLens write protection: read_only=%s multi_tenant_sessions=%s", PORTFOLIO_READ_ONLY, MULTI_TENANT_SESSIONS
+)
 
 
 def _verify_write_permission(
@@ -67,8 +159,9 @@ def _verify_write_permission(
 ) -> None:
     """
     Validates whether write operations are permitted.
-    In local development (PORTFOLIO_READ_ONLY=False), write operations are unrestricted.
-    In public portfolio mode (PORTFOLIO_READ_ONLY=True), only requests with a valid
+    With PORTFOLIO_READ_ONLY=False, writes are allowed (to the caller's own session in
+    MULTI_TENANT_SESSIONS mode, to the process-wide dataset otherwise).
+    With PORTFOLIO_READ_ONLY=True (emergency kill switch), only requests with a valid
     ADMIN_API_KEY via the X-Admin-Key or Authorization header are permitted.
     """
     if not PORTFOLIO_READ_ONLY:
@@ -120,46 +213,83 @@ app.add_middleware(
 # ── Rate Limiter & Security Safeguards ─────────────────────────────────────────
 class SlidingWindowRateLimiter:
     """
-    In-memory rate limiter per client IP.
-    Bypassed during automated testing and when RATE_LIMIT_ENABLED is disabled.
+    In-memory sliding-window limiter per client IP, with separate budgets for
+    normal requests, uploads, and visitor-session creation.
     """
-    def __init__(self, default_limit: int = 120, upload_limit: int = 20) -> None:
+    _MAX_TRACKED_KEYS = 1000
+
+    def __init__(self, default_limit: int = 120, upload_limit: int = 20, session_limit: int = 10) -> None:
         self.default_limit = default_limit
         self.upload_limit = upload_limit
-        self._history: dict[str, list[float]] = defaultdict(list)
-        self._upload_history: dict[str, list[float]] = defaultdict(list)
+        self.session_limit = session_limit
+        self._stores: dict[str, dict[str, list[float]]] = {"default": {}, "upload": {}, "session": {}}
+        self._lock = threading.Lock()
 
-    def is_allowed(self, ip: str, is_upload: bool = False) -> tuple[bool, int]:
-        now = time.time()
+    def is_allowed(self, ip: str, is_upload: bool = False, is_session: bool = False) -> tuple[bool, int]:
+        kind = "session" if is_session else ("upload" if is_upload else "default")
+        limit = {"session": self.session_limit, "upload": self.upload_limit, "default": self.default_limit}[kind]
         window = 60.0
-        limit = self.upload_limit if is_upload else self.default_limit
-        store = self._upload_history if is_upload else self._history
-        hist = store[ip]
-
-        # Prune entries older than 60 seconds
+        now = time.time()
         cutoff = now - window
-        hist[:] = [t for t in hist if t > cutoff]
 
-        # Prevent unbounded dictionary memory growth from inactive IPs
-        if not hist and len(store) > 1000:
-            store.pop(ip, None)
+        with self._lock:
+            store = self._stores[kind]
+            # Bound memory: when many distinct keys accumulate, drop the ones that went quiet.
+            if len(store) > self._MAX_TRACKED_KEYS:
+                for key in [k for k, h in store.items() if not h or h[-1] <= cutoff]:
+                    store.pop(key, None)
 
-        if len(hist) >= limit:
-            retry_after = int(window - (now - hist[0])) + 1
-            return False, max(1, retry_after)
+            hist = store.setdefault(ip, [])
+            hist[:] = [t for t in hist if t > cutoff]
+            if len(hist) >= limit:
+                return False, max(1, int(window - (now - hist[0])) + 1)
+            hist.append(now)
+            return True, 0
 
-        hist.append(now)
-        return True, 0
+
+def _env_int_setting(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
-rate_limiter = SlidingWindowRateLimiter()
+rate_limiter = SlidingWindowRateLimiter(
+    default_limit=_env_int_setting("RATE_LIMIT_PER_MIN", 120),
+    upload_limit=_env_int_setting("UPLOAD_RATE_LIMIT_PER_MIN", 20),
+    session_limit=_env_int_setting("SESSION_CREATE_LIMIT_PER_MIN", 10),
+)
+
+# Which request header carries the real client IP. X-Forwarded-For is NOT trusted by
+# default: Render appends to a client-supplied value, so its left-most entry is spoofable.
+# Behind Render, Cloudflare sets True-Client-IP itself, so that is the default there.
+# Set CLIENT_IP_HEADER (e.g. "true-client-ip", "cf-connecting-ip") to match your proxy.
+CLIENT_IP_HEADER = os.getenv("CLIENT_IP_HEADER", "").strip().lower() or ("true-client-ip" if _ON_PUBLIC_HOST else "")
 
 
 def _get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    if CLIENT_IP_HEADER:
+        value = request.headers.get(CLIENT_IP_HEADER, "").strip()
+        if value:
+            return value.split(",")[0].strip()[:64]
     return request.client.host if request.client else "unknown"
+
+
+def _is_test_client(request: Request) -> bool:
+    """Starlette's TestClient reports its socket peer as 'testclient'. Headers are never consulted."""
+    return bool(request.client and request.client.host == "testclient")
+
+
+def _json_error(status_code: int, detail: str, headers: Optional[dict[str, str]] = None) -> JSONResponse:
+    resp = JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
+    return _with_security_headers(resp)
+
+
+def _with_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 
 @app.middleware("http")
@@ -168,26 +298,40 @@ async def security_and_rate_limit_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client_ip = _get_client_ip(request)
-    is_test = client_ip in ("testclient",) or os.getenv("TESTING") == "true"
+    path = request.url.path
+    is_post = request.method == "POST"
+    is_upload = is_post and path in UPLOAD_PATHS
+    is_session_create = is_post and path == "/api/session"
 
-    if RATE_LIMIT_ENABLED and not is_test:
-        is_upload = request.url.path in ("/api/analyze", "/api/analyze/windows")
-        allowed, retry_after = rate_limiter.is_allowed(client_ip, is_upload=is_upload)
+    if RATE_LIMIT_ENABLED and not _is_test_client(request):
+        allowed, retry_after = rate_limiter.is_allowed(
+            _get_client_ip(request), is_upload=is_upload, is_session=is_session_create
+        )
         if not allowed:
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={"detail": "Too many requests. Please slow down and try again shortly."},
+            return _json_error(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "Too many requests. Please slow down and try again shortly.",
                 headers={"Retry-After": str(retry_after)},
             )
 
-    response = await call_next(request)
+    # Reject oversized uploads from the declared length, before the multipart body is
+    # spooled to disk. The streaming check in _read_upload_file_safe remains the backstop.
+    if is_upload:
+        declared = request.headers.get("content-length")
+        if declared is None:
+            return _json_error(status.HTTP_411_LENGTH_REQUIRED, "A Content-Length header is required for file uploads.")
+        try:
+            too_big = int(declared) > MAX_UPLOAD_SIZE_BYTES + UPLOAD_ENVELOPE_BYTES
+        except ValueError:
+            return _json_error(status.HTTP_400_BAD_REQUEST, "Invalid Content-Length header.")
+        if too_big:
+            return _json_error(
+                413,
+                f"File exceeds maximum size limit of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB.",
+            )
 
-    # Standard security headers on all responses
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    return response
+    response = await call_next(request)
+    return _with_security_headers(response)
 
 
 @app.exception_handler(Exception)
@@ -257,19 +401,17 @@ def format_alert(alert: Alert) -> dict[str, Any]:
     }
 
 
-# ── In-memory state ───────────────────────────────────────────────────────────
+# ── In-memory state (single-tenant mode only) ─────────────────────────────────
 
 class StateManager:
     """
-    Manages currently analyzed logs, generated alerts, and detection config
-    in memory.
-
-    Note: configuration is stored in memory only and resets when the backend
-    restarts. There is no authentication on the config endpoint; it is intended
-    for use on localhost only.
+    Process-wide dataset used when MULTI_TENANT_SESSIONS is false (local development
+    and tests). In multi-tenant mode this object is never read or written by any
+    endpoint; each visitor has a SessionState instead.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self.df: Optional[pd.DataFrame] = None
         self.alerts: list[Alert] = []
         self.dataset_name: str = "None"
@@ -277,33 +419,36 @@ class StateManager:
         self.is_sample: bool = False
         self.log_format: str = "standard"
         self.import_report: Optional[dict] = None
-        self.config: DetectorConfig = DetectorConfig()  # Phase 6: shared config
+        self.config: DetectorConfig = DetectorConfig()
         # Clean startup: backend starts with an empty dataset by default.
-        # Live mode displays zero metrics until the user uploads logs.
+
+    def snapshot(self) -> DataSnapshot:
+        with self._lock:
+            return DataSnapshot(
+                self.df, self.alerts, self.dataset_name, self.analyzed_at,
+                self.is_sample, self.log_format, self.import_report, None,
+            )
 
     def reset_to_empty(self) -> None:
         """Clear all active data, returning to a clean empty state (Live Mode reset)."""
-        self.df = None
-        self.alerts = []
-        self.dataset_name = "None"
-        self.analyzed_at = datetime.now(timezone.utc).isoformat()
-        self.is_sample = False
-        self.log_format = "standard"
-        self.import_report = None
+        with self._lock:
+            self.df = None
+            self.alerts = []
+            self.dataset_name = "None"
+            self.analyzed_at = datetime.now(timezone.utc).isoformat()
+            self.is_sample = False
+            self.log_format = "standard"
+            self.import_report = None
         logger.info("Reset backend state to clean empty dataset.")
 
     def reset_to_sample(self) -> None:
         """Explicitly load the synthetic sample_logs.csv dataset (demo / test mechanism)."""
         if SAMPLE_CSV_PATH.exists():
             try:
-                self.df = load_log(SAMPLE_CSV_PATH)
-                self.alerts = run_detection(self.df, self.config)
-                self.dataset_name = "sample_logs.csv (Simulated Demo)"
-                self.analyzed_at = datetime.now(timezone.utc).isoformat()
-                self.is_sample = True
-                self.log_format = "standard"
-                self.import_report = None
-                logger.info("Loaded sample dataset: %d rows, %d alerts.", len(self.df), len(self.alerts))
+                df = load_log(SAMPLE_CSV_PATH)
+                alerts = run_detection(df, self.config)
+                self.set_data(df, alerts, SAMPLE_DATASET_NAME, is_sample=True)
+                logger.info("Loaded sample dataset: %d rows, %d alerts.", len(df), len(alerts))
             except Exception as exc:
                 logger.warning("Failed to load sample data: %s", exc)
                 self.reset_to_empty()
@@ -321,19 +466,25 @@ class StateManager:
         log_format: str = "standard",
         import_report: Optional[dict] = None,
     ) -> None:
-        self.df = df
-        self.alerts = alerts
-        self.dataset_name = filename
-        self.analyzed_at = datetime.now(timezone.utc).isoformat()
-        self.is_sample = is_sample
-        self.log_format = log_format
-        self.import_report = import_report
+        with self._lock:
+            self.df = df
+            self.alerts = alerts
+            self.dataset_name = filename
+            self.analyzed_at = datetime.now(timezone.utc).isoformat()
+            self.is_sample = is_sample
+            self.log_format = log_format
+            self.import_report = import_report
 
 
 state = StateManager()
 
+DataContext = Union[StateManager, SessionState]
+
 
 # ── Helper to build summary stats and charts ──────────────────────────────────
+
+MAX_ACTIVITY_BUCKETS = 2000
+
 
 def compute_summary(
     df: Optional[pd.DataFrame],
@@ -397,14 +548,12 @@ def compute_summary(
     df_sorted = df.sort_values("timestamp")
     time_span_seconds = (df_sorted["timestamp"].max() - df_sorted["timestamp"].min()).total_seconds()
 
-    # Alert timestamps map
-    alert_times: list[pd.Timestamp] = []
-    for a in alerts:
-        for ev in a.evidence:
-            try:
-                alert_times.append(pd.to_datetime(ev["timestamp"]))
-            except Exception:
-                pass
+    # Alert timestamps (parsed in one vectorised call; unparseable values are skipped)
+    raw_alert_times = [ev["timestamp"] for a in alerts for ev in a.evidence if ev.get("timestamp")]
+    try:
+        alert_times = pd.to_datetime(pd.Series(raw_alert_times, dtype="object"), errors="coerce").dropna()
+    except Exception:
+        alert_times = pd.Series([], dtype="datetime64[ns]")
 
     activity_data = []
     if time_span_seconds > 86400 * 2:
@@ -421,11 +570,15 @@ def compute_summary(
         fmt = "%H:%M"
 
     try:
+        # Guard: timestamps spread over decades would create a huge number of empty buckets.
+        bucket_seconds = pd.Timedelta(freq).total_seconds()
+        if time_span_seconds / bucket_seconds > MAX_ACTIVITY_BUCKETS:
+            raise ValueError("time span too wide for an activity timeline")
         grouped = df_sorted.set_index("timestamp").resample(freq).size()
         for ts, count in grouped.items():
             bucket_end = ts + pd.Timedelta(freq)
             # Count alerts in this bucket
-            bucket_threats = sum(1 for at in alert_times if ts <= at < bucket_end)
+            bucket_threats = int(((alert_times >= ts) & (alert_times < bucket_end)).sum())
             activity_data.append({
                 "date": ts.strftime(fmt),
                 "events": int(count),
@@ -439,6 +592,11 @@ def compute_summary(
     ip_alerts: dict[str, list[Alert]] = {}
     for a in alerts:
         ip_alerts.setdefault(a.source_ip, []).append(a)
+
+    # First/last seen per IP from one groupby (a per-IP full-frame filter is O(IPs x rows)).
+    ts_bounds = df.groupby("source_ip")["timestamp"].agg(["min", "max"])
+    first_by_ip = ts_bounds["min"].to_dict()
+    last_by_ip = ts_bounds["max"].to_dict()
 
     suspicious_ips = []
     # Rank IPs that have alerts first, then highest event counts
@@ -455,9 +613,8 @@ def compute_summary(
             sev_label = "Normal"
 
         status_str = "Active Threat" if al_list else "Monitoring"
-        ip_rows = df[df["source_ip"] == ip]
-        last_seen = str(ip_rows["timestamp"].max()) if not ip_rows.empty else ""
-        first_seen = str(ip_rows["timestamp"].min()) if not ip_rows.empty else ""
+        last_seen = str(last_by_ip[ip]) if ip in last_by_ip else ""
+        first_seen = str(first_by_ip[ip]) if ip in first_by_ip else ""
         top_threat = al_list[0].event_type if al_list else "Normal Traffic"
         event_cnt = int(ip_events.get(ip, 0))
 
@@ -516,37 +673,137 @@ def compute_summary(
     }
 
 
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+SESSION_INVALID_MESSAGE = (
+    "Your visitor session is missing, invalid or has expired. "
+    "A fresh session starts empty; re-upload your CSV to continue."
+)
+
+
+def _session_error_to_http(exc: SessionError) -> HTTPException:
+    """Map session-manager failures onto stable HTTP statuses."""
+    if isinstance(exc, SessionInvalidTokenError):
+        return HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+    if isinstance(exc, SessionConflictError):
+        return HTTPException(status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, SessionMemoryError):
+        return HTTPException(413, detail=str(exc))
+    if isinstance(exc, SessionConcurrencyError):
+        return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc), headers={"Retry-After": "5"})
+    if isinstance(exc, SessionCapacityError):
+        return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc), headers={"Retry-After": "30"})
+    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Session error.")
+
+
+def _resolve_context(x_session_id: Optional[str]) -> DataContext:
+    """
+    The dataset a request operates on.
+
+    Multi-tenant mode: the caller's own session, or HTTP 401. There is deliberately no
+    fallback to the shared ``state`` - a bad token must never expose another dataset.
+    """
+    if not MULTI_TENANT_SESSIONS:
+        return state
+    session = session_manager.get_session(x_session_id, touch=True)
+    if session is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+    return session
+
+
+def _summary_from_snapshot(snap: DataSnapshot) -> dict[str, Any]:
+    """Cached summary when the session has one (computed once at upload); else compute."""
+    if snap.summary is not None:
+        return snap.summary
+    return compute_summary(
+        snap.df, snap.alerts, snap.dataset_name, snap.analyzed_at,
+        snap.is_sample, snap.log_format, snap.import_report,
+    )
+
+
+def _limits_payload() -> dict[str, Any]:
+    return {
+        "max_upload_size_mb": MAX_UPLOAD_SIZE_BYTES // (1024 * 1024),
+        "max_upload_rows": MAX_UPLOAD_ROWS,
+        "session_idle_timeout_minutes": int(session_manager.ttl_seconds // 60),
+    }
+
 
 @app.get("/api/health")
 def get_health() -> dict[str, Any]:
-    """Health check endpoint confirming API service and detection engine status."""
-    return {
+    """
+    Health check and capability discovery.
+
+    In multi-tenant mode this reports nothing about any visitor's data.
+    ``uploads_enabled`` is the single flag the frontend uses to enable upload controls.
+    """
+    if PORTFOLIO_READ_ONLY:
+        mode = "portfolio_read_only"
+    elif MULTI_TENANT_SESSIONS:
+        mode = "multi_tenant_sessions"
+    else:
+        mode = "full_access"
+
+    payload: dict[str, Any] = {
         "status": "ok",
         "service": "threatlens-api",
         "version": "1.0.0",
         "engine": "ready",
-        "dataset_loaded": state.df is not None and not state.df.empty,
-        "total_rows": len(state.df) if state.df is not None else 0,
-        "total_alerts": len(state.alerts),
-        "log_format": state.log_format,
         "read_only": PORTFOLIO_READ_ONLY,
-        "mode": "portfolio_read_only" if PORTFOLIO_READ_ONLY else "full_access",
+        "mode": mode,
+        "multi_tenant": MULTI_TENANT_SESSIONS,
+        "uploads_enabled": not PORTFOLIO_READ_ONLY,
+        "limits": _limits_payload(),
     }
+    if not MULTI_TENANT_SESSIONS:
+        snap = state.snapshot()
+        payload.update({
+            "dataset_loaded": snap.df is not None and not snap.df.empty,
+            "total_rows": len(snap.df) if snap.df is not None else 0,
+            "total_alerts": len(snap.alerts),
+            "log_format": snap.log_format,
+        })
+    return payload
+
+
+@app.post("/api/session")
+def create_visitor_session() -> JSONResponse:
+    """Issue a new visitor session. The token is a bearer credential for X-Session-ID."""
+    if not MULTI_TENANT_SESSIONS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Visitor sessions are not enabled on this deployment.")
+    try:
+        session = session_manager.create_session()
+    except SessionError as exc:
+        raise _session_error_to_http(exc)
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={
+            "session_id": session.session_id,
+            "idle_timeout_seconds": int(session_manager.ttl_seconds),
+            "limits": _limits_payload(),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/session")
+def end_visitor_session(
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+) -> dict[str, Any]:
+    """End the caller's own session and free its data. Idempotent."""
+    if not MULTI_TENANT_SESSIONS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Visitor sessions are not enabled on this deployment.")
+    return {"success": True, "deleted": session_manager.delete_session(x_session_id)}
 
 
 @app.get("/api/summary")
-def get_summary() -> dict[str, Any]:
-    """Return summary metrics, charts, and suspicious IP rankings for current dataset."""
-    return compute_summary(
-        state.df,
-        state.alerts,
-        state.dataset_name,
-        state.analyzed_at,
-        state.is_sample,
-        state.log_format,
-        state.import_report,
-    )
+def get_summary(
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+) -> dict[str, Any]:
+    """Return summary metrics, charts, and suspicious IP rankings for the caller's dataset."""
+    ctx = _resolve_context(x_session_id)
+    return _summary_from_snapshot(ctx.snapshot())
 
 
 @app.get("/api/alerts")
@@ -559,9 +816,11 @@ def get_alerts(
     rule: Optional[str] = Query(None, description="Filter by detection rule name, e.g. BruteForce"),
     priority_label: Optional[str] = Query(None, description="Filter by priority label: Low, Medium, High, Critical"),
     affected_account: Optional[str] = Query(None, description="Filter by affected account (partial match)"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ) -> dict[str, Any]:
     """Retrieve structured alerts with optional severity, status, event_type, source_ip, rule, priority, account, and text search filters."""
-    formatted = [format_alert(a) for a in state.alerts]
+    ctx = _resolve_context(x_session_id)
+    formatted = [format_alert(a) for a in ctx.snapshot().alerts]
 
     results = []
     for item in formatted:
@@ -626,14 +885,17 @@ def get_logs(
     level: Optional[str] = Query(None, description="Filter by level: ALL, CRITICAL, ERROR, WARN, INFO"),
     search: Optional[str] = Query(None, description="Search in source IP, event_type, message"),
     limit: int = Query(200, ge=1, le=1000, description="Max logs to return"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ) -> dict[str, Any]:
     """Return parsed log entries formatted for the Log Analysis viewer."""
-    if state.df is None or state.df.empty:
+    ctx = _resolve_context(x_session_id)
+    log_df = ctx.snapshot().df
+    if log_df is None or log_df.empty:
         return {"total": 0, "logs": []}
 
     # Map event_types and statuses to log levels
     logs = []
-    for idx, row in state.df.iterrows():
+    for idx, row in log_df.iterrows():
         event_type = str(row["event_type"])
         status_val = str(row["status"])
         source_ip = str(row["source_ip"])
@@ -740,22 +1002,33 @@ async def _read_upload_file_safe(file: UploadFile, max_bytes: int) -> bytes:
         await file.close()
 
 
-@app.post("/api/analyze/windows")
-async def analyze_windows_file(
-    file: UploadFile = File(...),
-    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
-    authorization: Optional[str] = Header(None),
-) -> dict[str, Any]:
-    """Import and analyze an exported Windows Security event log CSV file."""
-    _verify_write_permission(x_admin_key, authorization, action="Windows log upload and analysis is")
-    raw_filename = file.filename or "windows_security_log.csv"
-    filename = os.path.basename(raw_filename)
+
+# ── Upload pipeline ───────────────────────────────────────────────────────────
+
+class _Parsed(NamedTuple):
+    df: pd.DataFrame
+    alerts: list
+    format_name: str
+    report_dict: Optional[dict]
+
+
+def _validate_upload_filename(file: UploadFile, windows_only: bool) -> str:
+    raw_filename = file.filename or ("windows_security_log.csv" if windows_only else "uploaded.csv")
+    filename = os.path.basename(raw_filename)[:255]
     if not filename.lower().endswith(".csv"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file format. Only Windows Event Viewer CSV exports (.csv) are accepted. Native .evtx files are not supported.",
+            detail=(
+                "Invalid file format. Only Windows Event Viewer CSV exports (.csv) are accepted. "
+                "Native .evtx files are not supported."
+                if windows_only
+                else "Invalid file format. Only CSV files (.csv) are accepted."
+            ),
         )
+    return filename
 
+
+async def _read_upload_bytes(file: UploadFile, windows_only: bool) -> bytes:
     try:
         content_bytes = await _read_upload_file_safe(file, MAX_UPLOAD_SIZE_BYTES)
     except HTTPException:
@@ -765,140 +1038,55 @@ async def analyze_windows_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to read file content: {exc}",
         )
-
     if len(content_bytes) == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The uploaded Windows log file is empty.",
+            detail="The uploaded Windows log file is empty." if windows_only else "The uploaded file is empty.",
         )
+    return content_bytes
 
+
+def _decode_upload(content_bytes: bytes, windows_only: bool) -> str:
     try:
-        text_content = content_bytes.decode("utf-8")
+        return content_bytes.decode("utf-8")
     except UnicodeDecodeError:
+        pass
+    if windows_only:
         try:
-            text_content = content_bytes.decode("utf-16")
+            return content_bytes.decode("utf-16")
         except UnicodeDecodeError:
-            try:
-                text_content = content_bytes.decode("latin-1")
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File encoding error: {exc}. Please upload a UTF-8 or UTF-16 encoded CSV file.",
-                )
-
+            pass
     try:
-        df, report = load_windows_log(io.StringIO(text_content))
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Windows log import error: {exc}",
-        )
-    except Exception as exc:
-        logger.error("Unexpected parsing error in Windows log: %s", exc, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unexpected error parsing the Windows CSV file. Please ensure the file is a properly formatted Windows Event Viewer CSV export.",
-        )
-
-    if len(df) > MAX_UPLOAD_ROWS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Uploaded log contains {len(df)} rows, exceeding the portfolio analysis limit of {MAX_UPLOAD_ROWS} rows. Please upload a smaller log extract.",
-        )
-
-    try:
-        alerts = run_detection(df, state.config)
-    except Exception as exc:
-        logger.error("Detection engine error in Windows analysis: %s", exc, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Detection engine encountered an internal error during analysis.",
-        )
-
-    report_dict = report.to_dict()
-    state.set_data(
-        df=df,
-        alerts=alerts,
-        filename=filename,
-        is_sample=False,
-        log_format="windows_event_viewer",
-        import_report=report_dict,
-    )
-
-    summary = compute_summary(
-        df=df,
-        alerts=alerts,
-        dataset_name=filename,
-        analyzed_at=state.analyzed_at,
-        is_sample=False,
-        log_format="windows_event_viewer",
-        import_report=report_dict,
-    )
-    formatted_alerts = [format_alert(a) for a in alerts]
-
-    return {
-        "success": True,
-        "filename": filename,
-        "format": "windows_event_viewer",
-        "rows_processed": len(df),
-        "alerts_detected": len(alerts),
-        "import_report": report_dict,
-        "summary": summary,
-        "alerts": formatted_alerts,
-    }
-
-
-@app.post("/api/analyze")
-async def analyze_file(
-    file: UploadFile = File(...),
-    log_format: Optional[str] = Query(None, description="Optional log format: 'standard' or 'windows'"),
-    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
-    authorization: Optional[str] = Header(None),
-) -> dict[str, Any]:
-    """Analyze an uploaded CSV security log file and return structured detection results."""
-    _verify_write_permission(x_admin_key, authorization, action="Live CSV log upload and analysis is")
-    # 1. Validate filename
-    raw_filename = file.filename or "uploaded.csv"
-    filename = os.path.basename(raw_filename)
-    if not filename.lower().endswith(".csv"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file format. Only CSV files (.csv) are accepted.",
-        )
-
-    # 2. Read contents with streaming size restriction and handle cleanup
-    try:
-        content_bytes = await _read_upload_file_safe(file, MAX_UPLOAD_SIZE_BYTES)
-    except HTTPException:
-        raise
+        return content_bytes.decode("latin-1")
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to read file content: {exc}",
+            detail=f"File encoding error: {exc}. Please upload a UTF-8 or UTF-16 encoded CSV file."
+            if windows_only
+            else f"File encoding error: {exc}. Please upload a UTF-8 encoded CSV file.",
         )
 
-    if len(content_bytes) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The uploaded file is empty.",
-        )
 
-    # 3. Decode as text
-    try:
-        text_content = content_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            text_content = content_bytes.decode("latin-1")
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File encoding error: {exc}. Please upload a UTF-8 encoded CSV file.",
-            )
+def _parse_and_detect(
+    content_bytes: bytes,
+    windows_only: bool,
+    log_format: Optional[str],
+    config: DetectorConfig,
+) -> _Parsed:
+    """
+    CPU-bound: decode, parse, enforce the row limit, run detection.
+    Always executed in a worker thread (never on the event loop). The row limit is
+    enforced after parsing but before detection, which is the expensive step.
+    """
+    text_content = _decode_upload(content_bytes, windows_only)
 
-    # 4. Parse using appropriate parser
-    report_dict = None
+    report_dict: Optional[dict] = None
     format_name = "standard"
-    if log_format == "windows" or (log_format is None and is_windows_log(io.StringIO(text_content))):
+    use_windows = windows_only or log_format == "windows" or (
+        log_format is None and is_windows_log(io.StringIO(text_content))
+    )
+
+    if use_windows:
         try:
             df, report = load_windows_log(io.StringIO(text_content))
             report_dict = report.to_dict()
@@ -935,50 +1123,194 @@ async def analyze_file(
             detail=f"Uploaded log contains {len(df)} rows, exceeding the portfolio analysis limit of {MAX_UPLOAD_ROWS} rows. Please upload a smaller log extract.",
         )
 
-    # 5. Run detection rules
     try:
-        alerts = run_detection(df, state.config)
+        alerts = run_detection(df, config)
     except Exception as exc:
-        logger.error("Detection engine error during standard analysis: %s", exc, exc_info=True)
+        logger.error("Detection engine error during analysis: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Detection engine encountered an internal error during analysis.",
         )
 
-    # 6. Update in-memory state
-    state.set_data(
-        df=df,
-        alerts=alerts,
-        filename=filename,
-        is_sample=False,
-        log_format=format_name,
-        import_report=report_dict,
-    )
+    return _Parsed(df, alerts, format_name, report_dict)
 
-    summary = compute_summary(
-        df=df,
-        alerts=alerts,
-        dataset_name=filename,
-        analyzed_at=state.analyzed_at,
-        is_sample=False,
-        log_format=format_name,
-        import_report=report_dict,
-    )
-    formatted_alerts = [format_alert(a) for a in alerts]
 
-    res = {
+def _build_upload_response(
+    filename: str, windows_only: bool, parsed: _Parsed, summary: dict[str, Any]
+) -> dict[str, Any]:
+    """Response shapes match the historical single-tenant API exactly."""
+    formatted_alerts = [format_alert(a) for a in parsed.alerts]
+    if windows_only:
+        return {
+            "success": True,
+            "filename": filename,
+            "format": "windows_event_viewer",
+            "rows_processed": len(parsed.df),
+            "alerts_detected": len(parsed.alerts),
+            "import_report": parsed.report_dict,
+            "summary": summary,
+            "alerts": formatted_alerts,
+        }
+    res: dict[str, Any] = {
         "success": True,
         "filename": filename,
-        "rows_processed": len(df),
-        "alerts_detected": len(alerts),
+        "rows_processed": len(parsed.df),
+        "alerts_detected": len(parsed.alerts),
         "summary": summary,
         "alerts": formatted_alerts,
     }
-    if report_dict:
-        res["import_report"] = report_dict
-        res["format"] = format_name
-
+    if parsed.report_dict:
+        res["import_report"] = parsed.report_dict
+        res["format"] = parsed.format_name
     return res
+
+
+def _commit_single_tenant(
+    content: bytes, filename: str, windows_only: bool, log_format: Optional[str]
+) -> dict[str, Any]:
+    """Single-tenant path (worker thread): analyse, then replace the process-wide dataset."""
+    parsed = _parse_and_detect(content, windows_only, log_format, state.config)
+    state.set_data(
+        df=parsed.df, alerts=parsed.alerts, filename=filename, is_sample=False,
+        log_format=parsed.format_name, import_report=parsed.report_dict,
+    )
+    snap = state.snapshot()
+    summary = compute_summary(
+        parsed.df, parsed.alerts, filename, snap.analyzed_at, False, parsed.format_name, parsed.report_dict
+    )
+    return _build_upload_response(filename, windows_only, parsed, summary)
+
+
+def _commit_session_upload(
+    session: SessionState,
+    content: bytes,
+    filename: str,
+    windows_only: bool,
+    log_format: Optional[str],
+    is_sample: bool = False,
+) -> dict[str, Any]:
+    """
+    Multi-tenant path (worker thread). Under the session's mutation lock and a memory
+    reservation: analyse, compute the summary once, then commit everything to the
+    caller's session in one atomic step. Any failure leaves the session's previous
+    dataset untouched and releases the reservation.
+    """
+    try:
+        with session.transaction(timeout=SESSION_TXN_TIMEOUT_SECONDS):
+            reservation = session_manager.reserve_upload_memory(
+                session.session_id, estimate_incoming_bytes(len(content))
+            )
+            with reservation:
+                parsed = _parse_and_detect(content, windows_only, log_format, session.config)
+                analyzed_at = datetime.now(timezone.utc).isoformat()
+                summary = compute_summary(
+                    parsed.df, parsed.alerts, filename, analyzed_at, is_sample,
+                    parsed.format_name, parsed.report_dict,
+                )
+                final_bytes = estimate_dataset_memory(parsed.df, parsed.alerts)
+                reservation.commit(final_bytes)
+                session.set_data(
+                    df=parsed.df, alerts=parsed.alerts, filename=filename, is_sample=is_sample,
+                    log_format=parsed.format_name, import_report=parsed.report_dict,
+                    memory_bytes=final_bytes, analyzed_at=analyzed_at, summary=summary,
+                )
+    except SessionError as exc:
+        raise _session_error_to_http(exc)
+    return _build_upload_response(filename, windows_only, parsed, summary)
+
+
+def _session_upload_worker(lease, slot, *args: Any) -> dict[str, Any]:
+    """Run a session commit and always give back the lease and analysis slot."""
+    try:
+        return _commit_session_upload(lease.session, *args)
+    finally:
+        slot.release()
+        lease.release()
+
+
+async def _process_upload(
+    file: UploadFile,
+    *,
+    windows_only: bool,
+    log_format: Optional[str],
+    x_session_id: Optional[str],
+) -> dict[str, Any]:
+    filename = _validate_upload_filename(file, windows_only)
+
+    if not MULTI_TENANT_SESSIONS:
+        content = await _read_upload_bytes(file, windows_only)
+        return await run_in_threadpool(_commit_single_tenant, content, filename, windows_only, log_format)
+
+    # Multi-tenant: pin the session, take an analysis slot (no waiting: fail fast with 503
+    # so uploads can never queue unboundedly), then read the body. At most
+    # MAX_CONCURRENT_ANALYSES uploads ever hold their bytes in memory.
+    lease = session_manager.acquire_lease(x_session_id)
+    if lease is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+    try:
+        slot = session_manager.acquire_analysis_slot()
+    except SessionError as exc:
+        lease.release()
+        raise _session_error_to_http(exc)
+
+    handed_off = False
+    try:
+        content = await _read_upload_bytes(file, windows_only)
+        handed_off = True
+        # The worker owns lease+slot from here, even if the client disconnects mid-analysis.
+        return await run_in_threadpool(
+            _session_upload_worker, lease, slot, content, filename, windows_only, log_format
+        )
+    finally:
+        if not handed_off:
+            slot.release()
+            lease.release()
+
+
+@app.post("/api/analyze/windows")
+async def analyze_windows_file(
+    file: UploadFile = File(...),
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    authorization: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+) -> dict[str, Any]:
+    """Import and analyze an exported Windows Security event log CSV file."""
+    _verify_write_permission(x_admin_key, authorization, action="Windows log upload and analysis is")
+    return await _process_upload(file, windows_only=True, log_format=None, x_session_id=x_session_id)
+
+
+@app.post("/api/analyze")
+async def analyze_file(
+    file: UploadFile = File(...),
+    log_format: Optional[str] = Query(None, description="Optional log format: 'standard' or 'windows'"),
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    authorization: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+) -> dict[str, Any]:
+    """Analyze an uploaded CSV security log file and return structured detection results."""
+    _verify_write_permission(x_admin_key, authorization, action="Live CSV log upload and analysis is")
+    return await _process_upload(file, windows_only=False, log_format=log_format, x_session_id=x_session_id)
+
+
+def _load_sample_into_session(token: Optional[str]) -> None:
+    """Load the synthetic sample into the caller's session through the same limited pipeline."""
+    lease = session_manager.acquire_lease(token)
+    if lease is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+    try:
+        slot = session_manager.acquire_analysis_slot()
+    except SessionError as exc:
+        lease.release()
+        raise _session_error_to_http(exc)
+    try:
+        if not SAMPLE_CSV_PATH.exists():
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="The sample dataset is not available on this server.")
+        content = SAMPLE_CSV_PATH.read_bytes()
+    except BaseException:
+        slot.release()
+        lease.release()
+        raise
+    _session_upload_worker(lease, slot, content, SAMPLE_DATASET_NAME, False, None, True)
 
 
 @app.post("/api/reset")
@@ -989,33 +1321,38 @@ def reset_dataset(
     ),
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
     authorization: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ) -> dict[str, Any]:
     """
-    Reset active analysis state.
+    Reset the caller's active analysis state (their session in multi-tenant mode).
 
     By default, resets to a clean empty state for Live Mode (0 events, 0 alerts).
     If ?sample=true is passed, restores the synthetic demonstration dataset.
     """
     _verify_write_permission(x_admin_key, authorization, action="Resetting active analysis data is")
-    if sample:
-        state.reset_to_sample()
-        msg = "Reset to default sample dataset."
+    if MULTI_TENANT_SESSIONS:
+        session = session_manager.get_session(x_session_id, touch=True)
+        if session is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+        if sample:
+            _load_sample_into_session(x_session_id)
+        else:
+            try:
+                session.reset_to_empty(timeout=SESSION_TXN_TIMEOUT_SECONDS)
+            except SessionError as exc:
+                raise _session_error_to_http(exc)
+        ctx: DataContext = session
     else:
-        state.reset_to_empty()
-        msg = "Reset to clean empty state."
+        if sample:
+            state.reset_to_sample()
+        else:
+            state.reset_to_empty()
+        ctx = state
 
     return {
         "success": True,
-        "message": msg,
-        "summary": compute_summary(
-            state.df,
-            state.alerts,
-            state.dataset_name,
-            state.analyzed_at,
-            state.is_sample,
-            state.log_format,
-            state.import_report,
-        ),
+        "message": "Reset to default sample dataset." if sample else "Reset to clean empty state.",
+        "summary": _summary_from_snapshot(ctx.snapshot()),
     }
 
 
@@ -1023,48 +1360,50 @@ def reset_dataset(
 def load_sample_dataset(
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
     authorization: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ) -> dict[str, Any]:
     """
-    Dedicated endpoint to explicitly load the synthetic sample_logs.csv dataset.
-
-    Provides an isolated mechanism for demonstration or testing without
-    contaminating live backend startup state.
+    Dedicated endpoint to explicitly load the synthetic sample_logs.csv dataset
+    into the caller's own dataset.
     """
     _verify_write_permission(x_admin_key, authorization, action="Loading sample datasets via the API is")
-    state.reset_to_sample()
+    if MULTI_TENANT_SESSIONS:
+        if session_manager.get_session(x_session_id, touch=True) is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=SESSION_INVALID_MESSAGE)
+        _load_sample_into_session(x_session_id)
+        ctx = _resolve_context(x_session_id)
+    else:
+        state.reset_to_sample()
+        ctx = state
     return {
         "success": True,
         "message": "Loaded standard sample dataset.",
-        "summary": compute_summary(
-            state.df,
-            state.alerts,
-            state.dataset_name,
-            state.analyzed_at,
-            state.is_sample,
-            state.log_format,
-            state.import_report,
-        ),
+        "summary": _summary_from_snapshot(ctx.snapshot()),
     }
 
 
 # ── Phase 6: Detection configuration endpoints ────────────────────────────────
 
 @app.get("/api/detection/config")
-def get_detection_config() -> dict[str, Any]:
-    """
-    Retrieve the current detection configuration.
-
-    Configuration is stored in memory and resets to defaults when the backend
-    restarts. This endpoint is intended for localhost use only; there is no
-    authentication.
-    """
-    return {
-        "config": state.config.to_dict(),
-        "defaults": DetectorConfig.defaults(),
-        "note": (
+def get_detection_config(
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+) -> dict[str, Any]:
+    """Retrieve the detection configuration in effect for the caller (their session in multi-tenant mode)."""
+    ctx = _resolve_context(x_session_id)
+    if MULTI_TENANT_SESSIONS:
+        note = (
+            "These thresholds apply to your visitor session only and are cleared when the "
+            "session expires. Other visitors are not affected."
+        )
+    else:
+        note = (
             "Configuration is stored in memory only and resets to defaults on "
             "backend restart. No authentication is required for this endpoint."
-        ),
+        )
+    return {
+        "config": ctx.config.to_dict(),
+        "defaults": DetectorConfig.defaults(),
+        "note": note,
     }
 
 
@@ -1073,6 +1412,7 @@ def update_detection_config(
     body: dict,
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
     authorization: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ) -> dict[str, Any]:
     """
     Update detection configuration thresholds.
@@ -1081,16 +1421,14 @@ def update_detection_config(
     keys are rejected. Invalid values are validated and rejected before any
     changes are applied.
 
-    Configuration changes take effect on the next analysis request. The currently
-    loaded alerts are NOT automatically re-computed; upload or reset to apply
-    new thresholds to existing data.
+    In multi-tenant mode the change applies to the caller's session only, so no admin
+    key is needed (and none is ever sent by the frontend). In single-tenant mode the
+    change is process-wide, and ADMIN_API_KEY (when configured) is required.
 
-    Configuration is stored in memory only and resets on backend restart.
-    If ADMIN_API_KEY is configured in the environment, requests must provide
-    the matching key via the X-Admin-Key or Authorization header.
+    Changes take effect on the next analysis; loaded alerts are NOT recomputed.
     """
     _verify_write_permission(x_admin_key, authorization, action="Modifying detection thresholds is")
-    if ADMIN_API_KEY:
+    if ADMIN_API_KEY and not MULTI_TENANT_SESSIONS:
         token = authorization.replace("Bearer ", "").strip() if authorization and "Bearer " in authorization else None
         key = x_admin_key or token
         if not key or not hmac.compare_digest(key, ADMIN_API_KEY):
@@ -1098,6 +1436,8 @@ def update_detection_config(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Administrative authorization required to modify detection configuration in this deployment.",
             )
+
+    ctx = _resolve_context(x_session_id)
 
     if not isinstance(body, dict):
         raise HTTPException(
@@ -1115,7 +1455,7 @@ def update_detection_config(
         )
 
     # Build a merged dict: current config overridden by request body
-    merged = state.config.to_dict()
+    merged = ctx.config.to_dict()
     merged.update(body)
 
     try:
@@ -1133,11 +1473,11 @@ def update_detection_config(
             detail={"message": "Configuration validation failed.", "errors": errors},
         )
 
-    state.config = candidate
+    ctx.config = candidate
     logger.info("Detection configuration updated: %s", body)
 
     return {
         "success": True,
         "message": "Configuration updated. Re-upload or reset data to apply new thresholds.",
-        "config": state.config.to_dict(),
+        "config": ctx.config.to_dict(),
     }

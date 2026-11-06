@@ -32,6 +32,7 @@ import {
   uploadAndAnalyzeCsv,
   uploadWindowsLog,
   resetToSample,
+  consumeSessionReset,
   MAX_UPLOAD_SIZE_BYTES,
 } from '../services/api';
 import {
@@ -84,8 +85,19 @@ export function ThreatLensProvider({ children }) {
   const [uploadError, setUploadError] = useState(null);
   const [uploadResult, setUploadResult] = useState(null);
 
+  // Set when the backend expired the visitor's session and a fresh, empty one replaced it
+  const [sessionNotice, setSessionNotice] = useState(null);
+
   // Monotonically increasing sequence – prevents stale responses overwriting newer results
   const uploadSeqRef = useRef(0);
+
+  // ── Backend capabilities (from /api/health) ─────────────────────────────────
+  // uploads_enabled is the backend's own answer to "may visitors upload right now?".
+  // Older backends only send read_only, so fall back to its inverse.
+  const uploadsEnabled = engineInfo ? (engineInfo.uploads_enabled ?? !engineInfo.read_only) : true;
+  const isSessionMode = Boolean(engineInfo?.multi_tenant);
+  const advertisedMaxMb = Number(engineInfo?.limits?.max_upload_size_mb);
+  const maxUploadBytes = advertisedMaxMb > 0 ? advertisedMaxMb * 1024 * 1024 : MAX_UPLOAD_SIZE_BYTES;
 
   // ── Fetch real backend data ─────────────────────────────────────────────────
   const loadBackendData = useCallback(async () => {
@@ -112,9 +124,17 @@ export function ThreatLensProvider({ children }) {
         (summaryRes?.metadata?.rowsProcessed ?? 0) > 0
       );
       setHasRealData(hasReal);
+
+      // The backend replaced an expired or deleted session: notify the visitor why data is cleared
+      if (consumeSessionReset() && !hasReal) {
+        setSessionNotice(
+          'Your session expired after a period of inactivity, so your uploaded data was cleared. Upload your CSV again to continue.'
+        );
+      }
     } catch (err) {
       console.warn('ThreatLens backend not reachable:', err.message);
-      setBackendStatus('disconnected');
+      // A ThreatLens 503 (server at visitor/analysis capacity) means the backend IS reachable.
+      setBackendStatus(err.status === 503 && err.fromApp ? 'connected' : 'disconnected');
       setApiError(err.message || 'Unable to connect to Python backend.');
       // LIVE MODE: do NOT fall back to demo data. Keep live stores empty.
     } finally {
@@ -156,8 +176,8 @@ export function ThreatLensProvider({ children }) {
       setUploadError(err.message);
       throw err;
     }
-    if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-      const limitMb = MAX_UPLOAD_SIZE_BYTES / (1024 * 1024);
+    if (file.size > maxUploadBytes) {
+      const limitMb = maxUploadBytes / (1024 * 1024);
       const fileMb = (file.size / (1024 * 1024)).toFixed(1);
       const err = new Error(
         `File is too large (${fileMb} MB). Maximum allowed size is ${limitMb} MB.`
@@ -195,6 +215,10 @@ export function ThreatLensProvider({ children }) {
         importReport:   result.import_report || null,
         timestamp:      new Date().toLocaleTimeString(),
       });
+
+      // A successful upload defines the session's data; any earlier expiry notice is moot
+      consumeSessionReset();
+      setSessionNotice(null);
 
       // Update live stores from real upload result
       if (result.summary) setLiveSummary(result.summary);
@@ -315,8 +339,17 @@ export function ThreatLensProvider({ children }) {
     // hasRealData: whether a real (non-sample) dataset has been uploaded
     hasRealData,
 
-    // Public portfolio read-only status (true when backend is configured for public portfolio hosting)
-    isReadOnly: Boolean(engineInfo?.read_only),
+    // Backend upload availability. isReadOnly is true whenever the backend refuses writes
+    // (emergency read-only switch); it stays false while the backend is still unknown/unreachable.
+    uploadsEnabled,
+    isReadOnly: engineInfo ? !uploadsEnabled : false,
+    // Per-visitor private sessions (public deployment) and the limits the backend advertises
+    isSessionMode,
+    maxUploadBytes,
+    maxUploadRows: engineInfo?.limits?.max_upload_rows ?? null,
+    sessionIdleMinutes: engineInfo?.limits?.session_idle_timeout_minutes ?? null,
+    sessionNotice,
+    clearSessionNotice: () => setSessionNotice(null),
 
     // Active display data (mode-resolved)
     summaryStats:  currentSummaryStats,

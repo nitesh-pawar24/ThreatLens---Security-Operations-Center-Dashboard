@@ -51,7 +51,7 @@ All security events, IP addresses, usernames, and alerts shown in this project a
 | Backend | FastAPI | ≥ 0.110 | ASGI REST API framework |
 | Backend | Uvicorn | ≥ 0.28 | ASGI server |
 | Backend | pandas | ≥ 2.0 | CSV parsing and time-window analysis |
-| Backend | pytest | ≥ 7.4 | Automated test suite (228 tests) |
+| Backend | pytest | ≥ 7.4 | Automated test suite (399 tests) |
 
 ---
 
@@ -204,8 +204,13 @@ source venv/bin/activate
 # 2. Install Python dependencies
 pip install -r backend/requirements.txt
 
-# 3. Start the FastAPI backend on port 8000
+# 3. Start the FastAPI backend on port 8000 with multi-tenant session isolation enabled
+# Windows PowerShell:
+$env:MULTI_TENANT_SESSIONS="true"
 python -m uvicorn backend.api:app --reload --port 8000
+
+# macOS / Linux:
+MULTI_TENANT_SESSIONS=true python -m uvicorn backend.api:app --reload --port 8000
 ```
 
 The backend will be available at **http://127.0.0.1:8000**.
@@ -243,28 +248,32 @@ Once the backend is running, interactive API docs are available at:
 
 | Method | Path | Description | Access / Protection |
 |--------|------|-------------|---------------------|
-| `GET` | `/api/health` | Backend health and engine status | Public |
-| `GET` | `/api/summary` | Dashboard metrics, charts, and suspicious IP rankings | Public |
-| `GET` | `/api/alerts` | Filterable alert list (severity, rule, IP, account, text search) | Public |
-| `GET` | `/api/logs` | Parsed log entries with level and text filters | Public |
-| `POST` | `/api/analyze` | Upload and analyze a standard ThreatLens CSV log | Rate-limited (20 uploads/min) |
-| `POST` | `/api/analyze/windows` | Upload and analyze a Windows Event Viewer CSV export | Rate-limited (20 uploads/min) |
-| `POST` | `/api/reset` | Reset dataset (clean empty by default; `?sample=true` for demo) | Rate-limited |
-| `POST` | `/api/sample` | Explicitly load standard synthetic sample dataset | Rate-limited |
-| `GET` | `/api/detection/config` | Retrieve current detection thresholds | Public |
-| `PUT` | `/api/detection/config` | Update detection thresholds (validated) | `ADMIN_API_KEY` (if set) |
+| `GET` | `/api/health` | Backend health, capabilities (`uploads_enabled`, `multi_tenant`, limits) | Public, no session needed |
+| `POST` | `/api/session` | Issue a private visitor session token (`MULTI_TENANT_SESSIONS=true`) | Rate-limited (10/min per IP) |
+| `DELETE` | `/api/session` | End your own session and free its data | `X-Session-ID` |
+| `GET` | `/api/summary` | Dashboard metrics, charts, and suspicious IP rankings | `X-Session-ID` in session mode |
+| `GET` | `/api/alerts` | Filterable alert list (severity, rule, IP, account, text search) | `X-Session-ID` in session mode |
+| `GET` | `/api/logs` | Parsed log entries with level and text filters | `X-Session-ID` in session mode |
+| `POST` | `/api/analyze` | Upload and analyze a standard ThreatLens CSV log | Rate-limited (20/min), blocked by read-only switch |
+| `POST` | `/api/analyze/windows` | Upload and analyze a Windows Event Viewer CSV export | Rate-limited (20/min), blocked by read-only switch |
+| `POST` | `/api/reset` | Reset dataset (clean empty by default; `?sample=true` for demo) | Blocked by read-only switch |
+| `POST` | `/api/sample` | Explicitly load standard synthetic sample dataset | Blocked by read-only switch |
+| `GET` | `/api/detection/config` | Retrieve current detection thresholds | `X-Session-ID` in session mode |
+| `PUT` | `/api/detection/config` | Update detection thresholds (validated). Per-session in session mode | Blocked by read-only switch; `ADMIN_API_KEY` (single-tenant mode, if set) |
 | `GET` | `/api/windows/supported-events` | List supported Windows Event IDs | Public |
+
+In session mode (`MULTI_TENANT_SESSIONS=true`) a missing, malformed, unknown or expired `X-Session-ID` always returns `401`; there is never a fallback to another dataset.
 
 ---
 
 ## Running Automated Tests
 
 ```bash
-# Run all 228 backend tests with verbose output
+# Run all 399 backend tests with verbose output
 python -m pytest backend/tests/ -v --tb=short
 ```
 
-Expected result: **228 passed, 1 warning** (warning is an upstream Starlette TestClient HTTPX deprecation notice).
+Expected result: **399 passed, 1 warning** (warning is an upstream Starlette TestClient HTTPX deprecation notice).
 
 ### Test coverage
 
@@ -278,6 +287,8 @@ Expected result: **228 passed, 1 warning** (warning is an upstream Starlette Tes
 | `test_mode_isolation.py` | 11 | Clean Live Mode startup, empty state isolation, reset behavior |
 | `test_correlated_evidence.py` | 8 | Correlated supporting evidence, login sequences, investigation context |
 | `test_production_config.py` | 23 | Security headers, CORS origin filtering, rate limiting, upload guards, portfolio read-only mode, admin API key |
+| `test_session_unit.py` | 31 | Session manager: tokens, expiry, leases, transactions, memory reservations, analysis slots |
+| `test_session_api.py` | 138 | Visitor isolation, uploads/resets/sample/config per session, invalid and expired sessions, limits, concurrency, read-only kill switch, client-IP rate limiting, CORS |
 
 ---
 
@@ -370,17 +381,21 @@ ThreatLens/
 
 ThreatLens is built as an educational and portfolio demonstration application. Its architecture reflects specific security, privacy, and simplicity trade-offs:
 
-- **Public Portfolio Safe Access Strategy (`PORTFOLIO_READ_ONLY=true`):** In a public deployment (such as Render) where all unauthenticated visitors would otherwise share a single active in-memory dataset, setting `PORTFOLIO_READ_ONLY=true` makes Live Mode write-protected. Endpoints that modify state (`/api/analyze`, `/api/analyze/windows`, `/api/reset`, `/api/sample`, `/api/detection/config`) reject unauthenticated requests with `HTTP 403 Forbidden`. This eliminates the risk of cross-visitor data replacement and ensures zero data persistence.
+- **Per-visitor sessions for public uploads (`MULTI_TENANT_SESSIONS=true`):** The backend issues each visitor a random 256-bit token (`POST /api/session`). The frontend keeps it in `sessionStorage` and sends it as `X-Session-ID`. Summaries, alerts, logs, uploads, Windows uploads, resets, sample loading and detection thresholds all act only on that session's private in-memory state. There is no shared dataset in this mode, and a missing, malformed, unknown or expired token returns `401`; it never falls back to another visitor's (or a global) dataset. Sessions expire after 30 idle minutes (5 minutes if nothing was uploaded). Session count, per-session and total memory, concurrent analyses, file size and row count are all capped.
+- **Emergency read-only switch (`PORTFOLIO_READ_ONLY=true`):** Independent of session mode. When true, every write (`/api/analyze`, `/api/analyze/windows`, `/api/reset`, `/api/sample`, `/api/detection/config`) returns `HTTP 403` unless a valid `ADMIN_API_KEY` is presented; reads keep working. Flip it to instantly shut off uploads on a live deployment. Guard rail: on Render, `PORTFOLIO_READ_ONLY=false` *without* `MULTI_TENANT_SESSIONS=true` would let visitors overwrite one shared dataset, so the backend forces read-only in that case (override only with `ALLOW_SHARED_GLOBAL_STATE=true`).
 - **Unrestricted Public Demo Mode:** Reviewers, recruiters, and visitors can freely explore all SOC dashboard metrics, interactive timeline charts, severity distributions, and investigation dossiers in **Demo Mode**, which is evaluated entirely within the client browser without authentication or server state mutations.
-- **Full Local Access (`PORTFOLIO_READ_ONLY=false`):** When running locally, all Live Mode features—including custom CSV uploads, Windows Security Event Log imports, dataset resets, and detection threshold tuning—are completely open and unrestricted.
-- **Administrative Key Authorization (`ADMIN_API_KEY`):** If configured in the backend environment, administrators can authorize write operations on public deployments via `X-Admin-Key` or `Authorization: Bearer <key>` using constant-time `hmac.compare_digest`. No secret keys are ever bundled into the client JavaScript or exposed to frontend environment variables.
+- **Local mode (`MULTI_TENANT_SESSIONS=false`, `PORTFOLIO_READ_ONLY=false`):** When running locally, one process-wide dataset is used and all Live Mode features are open, exactly as before.
+- **Administrative Key Authorization (`ADMIN_API_KEY`):** If configured in the backend environment, an operator can authorize writes while the read-only switch is on via `X-Admin-Key` or `Authorization: Bearer <key>` using constant-time `hmac.compare_digest`. In session mode the admin key only ever writes into the caller's own session. No secret keys are bundled into the client JavaScript or exposed through frontend environment variables; visitors never need one.
 - **In-Memory Volatile Processing:** All CSV log parsing, detection evaluation, and alert correlation occur entirely in RAM via Pandas and FastAPI. No relational database, file cache, or persistent disk storage is used. When the container stops or restarts, active data vanishes completely.
 - **In-Memory Privacy Guarantee:** Uploaded logs are never saved to disk, forwarded to external analytics, or written to persistent volumes.
 - **Resource Protection & DoS Guardrails:** To protect public demo containers from memory exhaustion:
-  - File size cap: 10 MB maximum.
-  - Row count cap: 50,000 rows maximum per upload.
-  - Rate limiting: Sliding-window limiter per IP (120 req/min general, 20 req/min for uploads).
-  - Streaming uploads: Chunked upload validation rejects oversized payloads without loading them into RAM.
+  - File size cap (`MAX_UPLOAD_SIZE_MB`, default 10 MB): checked from `Content-Length` before the body is spooled, and again while streaming.
+  - Row cap (`MAX_UPLOAD_ROWS`, default 50,000): enforced after parsing but before the expensive detection step.
+  - Memory budgets: per session (`MAX_SESSION_MEMORY_MB`) and global (`MAX_TOTAL_MEMORY_MB`), enforced with reservations before parsing and re-checked on the analysed result. These are budgets for dataset memory, not process RSS.
+  - Concurrency: at most `MAX_CONCURRENT_ANALYSES` uploads are processed at once; extra uploads fail fast with `503` + `Retry-After`. Parsing and detection run in worker threads, so the API stays responsive.
+  - Session count (`MAX_ACTIVE_SESSIONS`) and per-IP session-creation rate limit.
+  - Rate limiting: sliding window per client IP (120 req/min general, 20/min uploads, 10/min new sessions). `X-Forwarded-For` is never trusted; set `CLIENT_IP_HEADER` (defaults to `true-client-ip` on Render).
+  - The summary is computed once per upload and cached, not on every request.
 - **No Live Network Sniffing:** ThreatLens is an offline/batch security log analyzer. It does not perform live network sniffing, packet capture (PCAP), or real-time event streaming.
 - **No Native `.evtx` Parsing:** Windows Event Viewer logs must be exported to CSV before upload; proprietary binary `.evtx` files are not accepted.
 
@@ -388,8 +403,9 @@ ThreatLens is built as an educational and portfolio demonstration application. I
 
 ## Current Limitations
 
-- **Single-session backend:** Only one active log dataset is held in memory at a time; uploading a new log replaces the current dataset.
-- **Stateless resets:** Backend restart or cloud idle spin-down returns Live Mode to a clean empty state (0 events, 0 alerts).
+- **One dataset per visitor session:** Uploading a new log replaces that session's dataset. Sessions are per browser tab (`sessionStorage`); a new tab starts a new, empty session.
+- **Sessions live in one process:** Run a single uvicorn worker. A restart, redeploy or free-tier idle spin-down clears every session (visitors are told their session expired and start empty).
+- **Memory limits are budgets, not guarantees:** They count dataset memory only; Python and pandas overhead and transient parsing buffers are extra, so keep headroom on small instances.
 - **Rule-based heuristics:** Detections are deterministic threshold heuristics without machine-learning anomaly scoring.
 - **Simulated demonstration data:** All bundled sample logs use RFC 5737 documentation IP ranges and fictitious usernames.
 

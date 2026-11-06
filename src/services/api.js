@@ -26,35 +26,152 @@ function resolveUrl(endpoint) {
   return `${API_BASE_URL}${endpoint}`;
 }
 
-/** Maximum CSV upload size – mirrors backend MAX_UPLOAD_SIZE_BYTES (10 MB) */
+/**
+ * Default maximum CSV upload size (10 MB). The backend advertises its real limit via
+ * /api/health (`limits.max_upload_size_mb`); the UI prefers that value when available.
+ */
 export const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024;
+
+// ── Visitor sessions ──────────────────────────────────────────────────────────
+// When the backend runs with MULTI_TENANT_SESSIONS=true, every data request must carry an
+// X-Session-ID header naming a private, server-issued session. The token is stored in
+// sessionStorage (per browser tab, cleared when the tab closes) with an in-memory fallback
+// for browsers where storage is unavailable. No admin credential is ever stored or sent.
+const SESSION_HEADER = 'X-Session-ID';
+const SESSION_STORAGE_KEY = 'threatlens.sessionId';
+const SESSION_TOKEN_PATTERN = /^tl_sess_[0-9a-f]{64}$/;
+
+let memorySessionId = null; // fallback when sessionStorage is unavailable
+let sessionMode = null; // null = unknown until /api/health has been read
+let sessionPromise = null; // single in-flight session creation (de-duplicates concurrent callers)
+let capabilityPromise = null; // single in-flight capability discovery
+let sessionWasReset = false; // set when an expired/invalid session had to be replaced
+
+function readStoredSession() {
+  try {
+    const value = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+    if (value && SESSION_TOKEN_PATTERN.test(value)) return value;
+    if (value) window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // sessionStorage unavailable (private mode, blocked): use the in-memory copy
+  }
+  return memorySessionId && SESSION_TOKEN_PATTERN.test(memorySessionId) ? memorySessionId : null;
+}
+
+function storeSession(id) {
+  memorySessionId = id;
+  try {
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+  } catch {
+    // in-memory copy still works for this page lifetime
+  }
+}
+
+function clearStoredSession() {
+  memorySessionId = null;
+  try {
+    window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // nothing to clear
+  }
+}
+
+/** Drop the stored token only if it is still the one that was rejected (avoids racing a newer one). */
+function invalidateSession(rejectedToken) {
+  if (readStoredSession() === rejectedToken) clearStoredSession();
+}
+
+/** True if a rejected/expired session was transparently replaced since the last call. */
+export function consumeSessionReset() {
+  const was = sessionWasReset;
+  sessionWasReset = false;
+  return was;
+}
+
+/** Whether the backend is in per-visitor session mode (null until the first health check). */
+export function isSessionMode() {
+  return sessionMode;
+}
+
+/**
+ * Return the current session token, creating one if needed. Concurrent callers share one
+ * creation request, so React StrictMode / parallel fetches never leak extra sessions.
+ */
+export async function ensureSession() {
+  const existing = readStoredSession();
+  if (existing) return existing;
+  if (!sessionPromise) {
+    sessionPromise = apiRequest('/api/session', { method: 'POST' }, { withSession: false })
+      .then((data) => {
+        storeSession(data.session_id);
+        return data.session_id;
+      })
+      .finally(() => {
+        sessionPromise = null;
+      });
+  }
+  return sessionPromise;
+}
+
+/** Learn whether the backend needs sessions before the first data request is sent. */
+function discoverCapabilities() {
+  if (!capabilityPromise) {
+    capabilityPromise = checkHealth().finally(() => {
+      capabilityPromise = null;
+    });
+  }
+  return capabilityPromise;
+}
 
 /**
  * Helper to perform fetch requests with unified error handling.
+ * In session mode it attaches X-Session-ID and, if the backend reports the session as
+ * missing/expired (HTTP 401), transparently creates a fresh session and retries once.
  */
-async function apiRequest(endpoint, options = {}) {
+async function apiRequest(endpoint, options = {}, { withSession = true } = {}) {
   const url = resolveUrl(endpoint);
   try {
-    const res = await fetch(url, { ...options });
-
-    if (!res.ok) {
-      let errorMsg = `Server error (${res.status})`;
-      try {
-        const errorData = await res.json();
-        if (errorData.detail) {
-          errorMsg = Array.isArray(errorData.detail)
-            ? errorData.detail.map((e) => e.msg).join(', ')
-            : errorData.detail;
-        }
-      } catch {
-        if (res.statusText) errorMsg = res.statusText;
+    for (let attempt = 0; ; attempt += 1) {
+      let token = null;
+      if (withSession) {
+        if (sessionMode === null) await discoverCapabilities();
+        if (sessionMode) token = await ensureSession();
       }
-      const error = new Error(errorMsg);
-      error.status = res.status;
-      throw error;
-    }
 
-    return await res.json();
+      const headers = { ...(options.headers || {}) };
+      if (token) headers[SESSION_HEADER] = token;
+      const res = await fetch(url, { ...options, headers });
+
+      if (res.status === 401 && token && attempt === 0) {
+        invalidateSession(token);
+        sessionWasReset = true;
+        continue;
+      }
+
+      if (!res.ok) {
+        let errorMsg = `Server error (${res.status})`;
+        let hasDetail = false;
+        try {
+          const errorData = await res.json();
+          if (errorData.detail) {
+            hasDetail = true;
+            errorMsg = Array.isArray(errorData.detail)
+              ? errorData.detail.map((e) => e.msg).join(', ')
+              : typeof errorData.detail === 'string'
+                ? errorData.detail
+                : errorData.detail.message || errorMsg;
+          }
+        } catch {
+          if (res.statusText) errorMsg = res.statusText;
+        }
+        const error = new Error(errorMsg);
+        error.status = res.status;
+        error.fromApp = hasDetail; // a ThreatLens JSON error, not a proxy/gateway page
+        throw error;
+      }
+
+      return await res.json();
+    }
   } catch (err) {
     if (err.name === 'TypeError' || (err.message && err.message.toLowerCase().includes('fetch'))) {
       const targetHint = API_BASE_URL || 'http://localhost:8000';
@@ -70,7 +187,9 @@ async function apiRequest(endpoint, options = {}) {
 
 /** Health check: verify API server status and detection engine state */
 export async function checkHealth() {
-  return await apiRequest('/api/health');
+  const health = await apiRequest('/api/health', {}, { withSession: false });
+  sessionMode = Boolean(health?.multi_tenant);
+  return health;
 }
 
 /** Retrieve summary metrics, activity chart, severity breakdown, and suspicious IPs */

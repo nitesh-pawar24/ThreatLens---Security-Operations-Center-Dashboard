@@ -6,6 +6,7 @@
 import { useState } from 'react';
 import Sidebar        from './components/Sidebar';
 import Header         from './components/Header';
+import SessionNotice  from './components/SessionNotice';
 import OverviewPage   from './pages/OverviewPage';
 import AlertsPage     from './pages/AlertsPage';
 import LogsPage       from './pages/LogsPage';
@@ -32,6 +33,7 @@ export default function App() {
         <Sidebar activePage={activePage} onNavigate={setActivePage} />
         <div className="main-area">
           <Header activePage={activePage} />
+          <SessionNotice />
           <PageComponent />
         </div>
       </div>

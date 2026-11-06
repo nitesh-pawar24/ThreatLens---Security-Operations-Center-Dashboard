@@ -5,6 +5,9 @@ services:
     region: oregon
     plan: free
     buildCommand: pip install -r backend/requirements.txt
+    # IMPORTANT: keep ONE worker. Visitor sessions live in this process's memory; adding
+    # --workers/--web-concurrency would split visitors across processes that cannot see
+    # each other's sessions (uploads would randomly "expire").
     startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
@@ -12,11 +15,42 @@ services:
         value: 3.11.0
       - key: FRONTEND_ORIGIN
         sync: false
+
+      # ── Write protection ──────────────────────────────────────────────────────
+      # Per-visitor private sessions make public uploads safe: every visitor gets an
+      # isolated dataset, so nobody can read or overwrite anyone else's data.
+      - key: MULTI_TENANT_SESSIONS
+        value: "true"
+      # Emergency kill switch. Set to "true" to instantly block ALL uploads, resets, sample
+      # loading and config changes (reads keep working). Independent of the setting above.
+      - key: PORTFOLIO_READ_ONLY
+        value: "false"
+
+      # ── Upload / analysis limits (sized for Render's 512 MB free instance) ───────
       - key: MAX_UPLOAD_SIZE_MB
-        value: "10"
+        value: "5"
       - key: MAX_UPLOAD_ROWS
-        value: "50000"
+        value: "10000"
+      - key: MAX_CONCURRENT_ANALYSES
+        value: "2"
+
+      # ── Session limits ───────────────────────────────────────────────────────────
+      - key: SESSION_TTL_MINUTES
+        value: "30"
+      - key: SESSION_EMPTY_TTL_MINUTES
+        value: "5"
+      - key: MAX_ACTIVE_SESSIONS
+        value: "200"
+      - key: MAX_SESSION_MEMORY_MB
+        value: "25"
+      - key: MAX_TOTAL_MEMORY_MB
+        value: "150"
+
+      # ── Rate limiting ────────────────────────────────────────────────────────────
       - key: RATE_LIMIT_ENABLED
         value: "true"
-      - key: PORTFOLIO_READ_ONLY
-        value: "true"
+      # Render forwards traffic through Cloudflare, which sets True-Client-IP itself.
+      # X-Forwarded-For is NOT used: Render appends to a client-supplied value, so its
+      # left-most entry can be spoofed to dodge per-IP limits.
+      - key: CLIENT_IP_HEADER
+        value: "true-client-ip"

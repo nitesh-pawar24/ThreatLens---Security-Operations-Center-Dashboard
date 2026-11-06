@@ -12,7 +12,6 @@ import {
   Monitor, Shield, ChevronDown, ChevronUp, FileSpreadsheet, Lock,
 } from 'lucide-react';
 import { useThreatLens } from '../context/ThreatLensContext';
-import { MAX_UPLOAD_SIZE_BYTES } from '../services/api';
 import { DEMO_NOTICE } from '../data/demoData';
 import { SeverityBadge } from '../components/Badges';
 
@@ -43,6 +42,9 @@ export default function LogsPage() {
     isUsingBackend,
     isLiveMode,
     isReadOnly,
+    isSessionMode,
+    maxUploadBytes,
+    sessionIdleMinutes,
     hasRealData,
     backendStatus,
     metadata,
@@ -91,8 +93,8 @@ export default function LogsPage() {
         setSelectedFile(null);
         return;
       }
-      if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-        const limitMb = MAX_UPLOAD_SIZE_BYTES / (1024 * 1024);
+      if (file.size > maxUploadBytes) {
+        const limitMb = maxUploadBytes / (1024 * 1024);
         const fileMb  = (file.size / (1024 * 1024)).toFixed(1);
         setLocalClientError(`File too large (${fileMb} MB). Maximum allowed size is ${limitMb} MB.`);
         setSelectedFile(null);
@@ -133,8 +135,8 @@ export default function LogsPage() {
         setSelectedFile(null);
         return;
       }
-      if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-        const limitMb = MAX_UPLOAD_SIZE_BYTES / (1024 * 1024);
+      if (file.size > maxUploadBytes) {
+        const limitMb = maxUploadBytes / (1024 * 1024);
         const fileMb  = (file.size / (1024 * 1024)).toFixed(1);
         setLocalClientError(`File too large (${fileMb} MB). Maximum allowed size is ${limitMb} MB.`);
         setSelectedFile(null);
@@ -224,7 +226,9 @@ export default function LogsPage() {
               <strong>Live Mode — Ready:</strong>{' '}
               {isReadOnly
                 ? 'Public cloud instance is in portfolio read-only mode to preserve visitor privacy. Switch to Demo Mode above to explore all features.'
-                : 'Upload a supported CSV file below to begin analysis.'}
+                : isSessionMode
+                  ? `Upload a supported CSV file below to begin analysis. Your upload is private to this browser session${sessionIdleMinutes ? ` and is cleared after ${sessionIdleMinutes} minutes of inactivity` : ''}.`
+                  : 'Upload a supported CSV file below to begin analysis.'}
             </span>
           </div>
         )
@@ -375,7 +379,7 @@ export default function LogsPage() {
                 Drop your {importFormat === 'windows' ? 'Windows Event Viewer CSV' : 'CSV log file'} here, or <span style={{ color: 'var(--accent)', textDecoration: 'underline' }}>browse</span>
               </div>
               <div style={{ color: 'var(--text-muted)', fontSize: 11, marginTop: 4 }}>
-                Accepted format: .csv (maximum size: 10 MB)
+                Accepted format: .csv (maximum size: {Math.round((maxUploadBytes / (1024 * 1024)) * 10) / 10} MB)
               </div>
             </div>
           )}
