@@ -4,6 +4,8 @@
 
 **ThreatLens is a demonstration project.** It analyzes uploaded log files locally, generates rule-based security alerts, and presents them in a professional SOC-style dashboard. It does **not** perform live network monitoring, packet capture, or any real-time surveillance. All sample data uses [RFC 5737](https://www.rfc-editor.org/rfc/rfc5737) documentation IP ranges and represents no real hosts or users.
 
+Deployed Website - https://threatlens-security-operations-cent.vercel.app/
+
 ---
 
 ## ⚠️ Important Disclaimer
